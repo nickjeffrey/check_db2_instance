@@ -1,0 +1,305 @@
+#!/usr/bin/perl -w
+
+ 
+# CHANGE LOG
+# ----------
+#  2020/05/07	njeffrey	Script created
+
+
+# FUTURE ENHANCEMENTS
+# -------------------
+# Currently assumes database instance is the default "db2inst1".  Enhance to support multiple DB2 instances.
+
+
+
+# NOTES
+# -----
+#
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
+#  methods available in nagios.
+#
+#  If you are using the check_by_ssh method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#   # Define service for checking IBM DB2 database instance status
+#   define service{
+#           use                             generic-24x7-service
+#           host_name                       unix11
+#           service_description             DB2
+#           check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_db2_instance"
+#           }
+#
+#  If you are using the check_nrpe method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#   # Define service for checking IBM DB2 database instance status
+#   define service{
+#           use                             generic-24x7-service
+#           host_name                       unix11
+#           service_description             DB2
+#           check_command                   check_nrpe!check_db2 -t 30
+#           }
+#
+#  If using NRPE, you will also need a section defining the NRPE command in the /usr/local/nagios/nrpe.cfg file that looks like this:
+#   command[check_db2]=/usr/local/nagios/libexec/check_db2
+#
+#
+# Schedule this script to run every 5 minutes from the crontab of the db2inst1 user, then have nagios just read the output file from the cron job.
+# Create cron entries in the db2inst1 user crontab similar to the following: 
+#   1,6,11,16,21,26,31,36,41,46,51,56 * * * * /usr/local/nagios/libexec/check_db2  1>/dev/null 2>/dev/null  #nagios helper script
+#
+
+
+
+
+# ASSUMPTIONS
+# -----------
+#  It is assumed that perl is installed on the machine running this script.
+#     For RHEL / CentOS     yum install perl
+#
+#
+#  It is assumed that this script is being run as a low-privileged user (typically nagios)
+#
+#
+
+
+
+
+
+# TROUBLESHOOTING
+# ---------------
+#   This script executes in the security context of the db2inst1 user
+#   Rather than give the nagios user and additional privileges, this script will run from the db2inst1 crontab every 5 minutes,
+#   generating a /tmp/nagios.check_db2_instance.tmp file.  This file will be read by the low-privileged nagios user
+#   when the check is run from nagios.
+#   Ensure the db2inst1 user crontab has an entry similar to the following:
+#   1,6,11,16,21,26,31,36,41,4651,56 * * * * /usr/local/nagios/libexec/check_db2 >/dev/null 2>&1 #nagios helper script 
+
+
+
+
+use strict;						#enforce good coding practices
+use Getopt::Long;                       		#allow --long-switches to be used as parameters
+
+#declare variables
+my ($verbose,$os,$cmd,$key);
+my ($uname,$db2gcf,$db2_instance,%db2);
+my ($seconds_since_epoch,$days_since_epoch);
+my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
+my ($common_output_data,$perf_data,$output_filename,$output_file_age,$output_message);
+my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);
+my ($opt_h,$opt_v);
+$verbose            = "no";				#yes/no flag to increase verbosity during debugging
+$common_output_data = "";                               #nagios output
+$perf_data          = "";                               #nagios performance data included in output
+$db2gcf = "/u01/app/IBM/db2/V11.1.1.1/bin/db2gcf";  	#location of binary.  Path varies by DB2 version.
+$CHECK_NAME         = "DB2";
+
+#
+# Nagios return codes
+#
+$OK=		0;
+$WARN=		1;
+$CRITICAL=	2;
+$UNKNOWN=	3;
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "Running get_options subroutine \n" if ($verbose eq "yes");
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"        => \$opt_h,
+      "v"   => \$opt_v, "verbose"      => \$opt_v,
+   );
+   #
+   # If the user supplied the -h or --help switch, give them some help.
+   #
+   if( defined( $opt_h ) ) {
+      print "Use this syntax \n";
+      print "   $0 \n";
+      print "   $0 --verbose     (increase output for debugging \n";
+      exit $CRITICAL;				#exit script
+   }
+   #
+   # If the user supplied the --verbose switch, increase output verbosity
+   #
+   if( defined( $opt_v ) ) {
+      $verbose = "yes";
+   } else {
+      $verbose = "no";
+   }
+}                       #end of subroutine
+
+
+
+
+
+sub sanity_checks {
+   #
+   print "Running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm uname binary exists and is executable
+   # figure out where the uname command is on this system (varies across UNIX flavors)
+   $uname = "/bin/uname"      if ( -e "/bin/uname");	
+   $uname = "/sbin/uname"     if ( -e "/sbin/uname");	
+   $uname = "/usr/bin/uname"  if ( -e "/usr/bin/uname");	
+   $uname = "/usr/sbin/uname" if ( -e "/usr/sbin/uname");	
+   if ( ! -e $uname ) {
+      print "ERROR: Cannot find $uname binary \n";
+      exit $CRITICAL;
+   }
+   if ( ! -x $uname ) {
+      print "ERROR: $uname is not executable by the current user \n";
+      exit $CRITICAL;
+   }
+   print "   found uname binary at $uname \n" if ($verbose eq "yes");
+   #
+   if ( ! -e $db2gcf ) {
+      print "ERROR: Cannot find $db2gcf binary.  The location of this file varies by DB2 version, so please check your system. \n";
+      exit $CRITICAL;
+   }
+   if ( ! -x $db2gcf ) {
+      print "ERROR: $db2gcf is not executable by the current user \n";
+      exit $CRITICAL;
+   }
+}						#end of subroutine
+
+
+
+
+sub check_for_output_file {
+   #
+   # a cron job may have already created the output file that we need
+   #
+   print "running check_for_output_file subroutine \n" if ($verbose eq "yes");
+   #
+   $output_filename = "/tmp/nagios.check_db2_instance.tmp";
+   #
+   # delete the output file if it is more than 5 minutes (300 seconds) old
+   if ( -e $output_filename ) {                                 #see if a cron job has already provided the info we need
+      ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($output_filename); #get last modification time in seconds since the epoch
+      $output_file_age = time - $mtime;                                 #figure out how many seconds old the file is
+      print "   output file $output_filename is $output_file_age seconds old \n" if ($verbose eq "yes");
+      if( $output_file_age >= 300 ) {                                   #see if the file is more than 300 seconds old
+         print "   deleting old copy of $output_filename \n" if ($verbose eq "yes");
+         unlink "$output_filename";                                     #delete the file if it is too old
+      }
+   }                                                                    #end of if block
+   #
+   if ( -e "$output_filename" ) {                               #see if a cron job has already provided the info we need
+      open (OUT,"$output_filename") or die "Cannot open $output_filename for reading $! \n";
+      while (<OUT>) {                                                   #read a line from the text file
+         $output_message = $_  if ( $_ =~ /[a-zA-Z]/);                  #get the content of the output file into a variable
+         print "   output message is $output_message \n" if ($verbose eq "yes");
+      }                                                                 #end of while loop
+      close OUT;                                                        #close filehandle
+      print $output_message;                                            #print the content of the output file
+      exit $CRITICAL if ( $output_message =~ /CRITICAL/ );              #exit script with appropriate return code
+      exit $WARN     if ( $output_message =~ /WARN/ );                  #exit script with appropriate return code
+      exit $UNKNOWN  if ( $output_message =~ /UNKNOWN/ );               #exit script with appropriate return code
+      exit $OK       if ( $output_message =~ /OK/ );                    #exit script with appropriate return code
+   }                                                                    #end of if block
+}                                                                       #end of subroutine
+
+
+
+
+sub print_to_outputfile {
+   #
+   print "running print_to_outputfile \n" if ($verbose eq "yes");
+   #
+   # This subroutine is called whenever an output message is printed, to confirm that the $output_file exists
+   #
+   # confirm the output message exists
+   $output_message = "$CHECK_NAME UNKNOWN - could not parse response from remote host \n" unless ($output_message);
+   #
+   # confirm the $output_filename variable is defined
+   unless ($output_filename) {
+      print "$CHECK_NAME UNKNOWN - the \$output_filename variable is not defined.  This might be a script bug. \n";
+      exit $UNKNOWN;                                                            #only get this far if OK/WARN/CRITICAL/UNKNOWN was not found in the output file
+   }                                                                            #end of unless block
+   #
+   if ( ! -e "$output_filename" ) {                                                     #only run this section if $output_filename does not already exist
+      print "   $output_filename not found - writing output message to $output_filename \n" if ($verbose eq "yes");
+      open (OUT,">$output_filename") or die "Cannot open $output_filename for writing: $! \n";
+      print OUT "$output_message";
+      close OUT;                                                                #close filehandle
+      chmod 0644, "$output_filename";                                           #set the file permission to -rw-r--r-- to ensure nagios user can read file
+   }                                                                            #end of if block
+}                                                                               #end of subroutine
+
+
+sub check_db2 {
+   #
+   print "Running check_db2 subroutine \n" if ($verbose eq "yes");
+   #
+   # Check to see if the db2inst1 database instance is available.  Sample command:
+   #   $ /u01/app/IBM/db2/V11.1.1.1/bin/db2gcf -s -i db2inst1
+   #   Instance  : db2inst1
+   #   DB2 State : Available 
+   #
+   #   The different DB2 State results can be:
+   #   Available    means the database is up and running
+   #   Operable     means the database is currently down but can be brought up
+   #   Not operable means the database is not operable and cannot be brought up
+   #
+   $db2_instance = "db2inst1"; 							#name of default DB2 database instance
+   $cmd = "$db2gcf -s -i $db2_instance";
+   print "   Running command $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");  	                                                	#open filehandle from command output
+   while (<IN>) {                                                       	#read a line from the command output
+      if ( /^DB2 State : (.*)/ ) {  						#find DB2 State line in command output
+         $db2{$db2_instance}{instance} = $db2_instance;				#save value in hash
+         $db2{$db2_instance}{state} = $1;					#save value in hash
+         #
+         $common_output_data = "$common_output_data db2_instance:$db2{$db2_instance}{instance} state:$db2{$db2_instance}{state} ";
+         print "$common_output_data \n" if ($verbose eq "yes");
+      }									#end of if block
+   }										#end of while loop
+   close IN;									#close filehandle
+}										#end of subroutine
+
+
+
+
+
+sub print_output {
+   #
+   print "Running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   # Send alert if the database instance state is anything other than "Available"
+   foreach $key (keys %db2) {
+      print "   db2_instance:$db2{$key}{instance} state:$db2{$key}{state} \n" if ($verbose eq "yes");
+      next unless ($db2{$key}{instance});
+      next unless ($db2{$key}{state});
+      if ( $db2{$key}{state} ne "Available" ) {
+         $output_message = "$CHECK_NAME WARN - DB2 database instance $db2{$key}{instance} is not available.  instance:$db2{$key}{instance} state:$db2{$key}{state}.  $common_output_data | $perf_data \n";
+         print "$output_message";		#print output to screen
+         print_to_outputfile;           	#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
+         exit $WARN;
+      } 								#end of if block
+   } 									#end of foreach block
+   #
+   # should only get here if everything is ok
+   $output_message = "$CHECK_NAME OK - all DB2 instances in Available state.  $common_output_data | $perf_data \n";
+   print "$output_message";		#print output to screen
+   print_to_outputfile;           	#call subroutine to confirm the output is in the $output_filename used for subsequent script runs
+   exit $OK;
+}			#end of subroutine
+
+
+
+
+# ---------------- main body of script -------------------------
+get_options;
+sanity_checks;
+check_for_output_file;
+check_db2;
+print_output;
+
